@@ -18,6 +18,63 @@ from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
 
 
+# Max base64 URL length we inspect inline before deciding it's a data URI.
+# Anything starting with "data:" is treated as an embedded payload regardless.
+_DATA_URI_PREFIX = "data:"
+_IMAGE_PART_TYPES_WITH_BASE64 = {"image_url", "input_image"}
+
+
+def _is_base64_image_part(part: Any) -> bool:
+    """Return True if ``part`` is an embedded base64 image payload."""
+    if not isinstance(part, dict):
+        return False
+    ptype = part.get("type")
+    if ptype == "image_url":
+        image_url = part.get("image_url") or {}
+        if isinstance(image_url, str):
+            url = image_url
+        elif isinstance(image_url, dict):
+            url = image_url.get("url", "")
+        else:
+            url = ""
+        return isinstance(url, str) and url.startswith(_DATA_URI_PREFIX)
+    if ptype == "input_image":
+        url = part.get("image_url", "")
+        return isinstance(url, str) and url.startswith(_DATA_URI_PREFIX)
+    if ptype == "image":
+        source = part.get("source") or {}
+        return isinstance(source, dict) and source.get("type") == "base64"
+    return False
+
+
+def _strip_base64_images_from_tool_result(content: Any) -> Any:
+    """Replace embedded base64 image parts in a tool result with text placeholders.
+
+    ``vision_analyze`` returns a content list like
+    ``[{"type": "text", "text": "..."}, {"type": "image_url", "image_url": {"url": "data:image/...;base64,..."}}]``.
+    The text summary is what the model needs for follow-up reasoning; the
+    base64 payload is only useful if we want to send the image back to the
+    model on the same turn. Keeping it in the conversation history makes every
+    subsequent request body explode and can push Ollama / strict providers over
+    their max body size, producing ``400 failed to read request body``.
+
+    This strips only ``role: "tool"`` results, and only parts that carry an
+    embedded ``data:`` URI. External image URLs are preserved.
+    """
+    if not isinstance(content, list):
+        return content
+    changed = False
+    out = []
+    placeholder = {"type": "text", "text": "[base64 image stripped from tool result to keep request small]"}
+    for part in content:
+        if _is_base64_image_part(part):
+            out.append(placeholder)
+            changed = True
+            continue
+        out.append(part)
+    return out if changed else content
+
+
 def _reasoning_config_for_model(model: str, reasoning_config: dict | None) -> dict | None:
     """Return the model's wire-compatible reasoning config."""
     if not isinstance(reasoning_config, dict):
@@ -194,6 +251,12 @@ class ChatCompletionsTransport(ProviderTransport):
             if any(isinstance(k, str) and k.startswith("_") for k in msg):
                 needs_sanitize = True
                 break
+            # Embedded base64 images in tool results bloat the request body and
+            # can overflow providers (#context-engine-strip-tool-base64-2026-07-19).
+            if msg.get("role") == "tool" and isinstance(msg.get("content"), list):
+                if any(_is_base64_image_part(p) for p in msg["content"]):
+                    needs_sanitize = True
+                    break
             tool_calls = msg.get("tool_calls")
             if isinstance(tool_calls, list):
                 for tc in tool_calls:
@@ -240,6 +303,17 @@ class ChatCompletionsTransport(ProviderTransport):
                 out_msg.pop("timestamp", None)  # #47868 — leak into strict providers
                 out_msg.pop("api_content", None)  # persist-what-you-send sidecar
 
+
+            # Strip embedded base64 image payloads from tool results.
+            # vision_analyze returns the analyzed image as a data: URI inside
+            # the tool result content list; keeping it in the conversation makes
+            # every follow-up request body multi-MB and can overflow providers.
+            if msg.get("role") == "tool":
+                content = msg.get("content")
+                if isinstance(content, list):
+                    stripped = _strip_base64_images_from_tool_result(content)
+                    if stripped is not content:
+                        mutable_msg()["content"] = stripped
 
             # Drop all Hermes-internal scaffolding markers (``_``-prefixed).
             # OpenAI's message schema has no ``_``-prefixed fields, so this
