@@ -480,7 +480,17 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # ── Volatile tier (changes per session/turn — never cached) ───
     volatile_parts: List[str] = []
 
-    if agent._memory_store:
+    # Built-in MemoryStore block. Skip it when an external memory provider is
+    # configured and active; that provider owns persistence and injects its
+    # own system-prompt block below. Including the built-in block as well would
+    # load stale root MEMORY.md/USER.md and duplicate or contradict the
+    # external provider's content (#keirstin).
+    _external_memory_provider = (
+        (getattr(agent, "_agent_cfg", {}) or {}).get("memory", {}) or {}
+    ).get("provider", "").strip()
+    _skip_builtin_memory_block = bool(_external_memory_provider) and _external_memory_provider != "builtin"
+
+    if agent._memory_store and not _skip_builtin_memory_block:
         if agent._memory_enabled:
             mem_block = agent._memory_store.format_for_system_prompt("memory")
             if mem_block:
