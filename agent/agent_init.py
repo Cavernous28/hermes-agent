@@ -1576,29 +1576,51 @@ def init_agent(
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
-    # A flush/background agent may pass skip_memory=True to avoid spinning up an
-    # external memory *provider*, but if the caller also explicitly enables the
-    # "memory" toolset it still needs the built-in file-backed store — otherwise
-    # the memory tool dispatches with store=None and every call fails (#65429).
-    # So the built-in store is created unless memory is globally disabled, while
-    # the external-provider block below stays gated on skip_memory.
+
+    mem_config = _agent_cfg.get("memory", {}) or {}
+    _external_memory_provider = (mem_config.get("provider") or "").strip()
+    _builtin_memory_requested = (
+        mem_config.get("memory_enabled", False)
+        or mem_config.get("user_profile_enabled", False)
+    )
+
+    # When an external memory provider is configured, it owns persistence.
+    # Do not spin up the built-in MemoryStore just because user_profile_enabled
+    # is true; that writes shadow MEMORY.md/USER.md files into the memories
+    # root and duplicates/outdates the external provider's storage (#keirstin).
+    # The built-in store is only created when:
+    #   - memory is explicitly enabled (memory_enabled / user_profile_enabled), AND
+    #   - no external provider is configured, OR the "memory" toolset is explicitly
+    #     requested (so the memory_tool has a store to dispatch against).
     _memory_toolset_requested = "memory" in (agent.enabled_toolsets or [])
-    if not skip_memory or _memory_toolset_requested:
+    _use_builtin_store = (
+        (not skip_memory or _memory_toolset_requested)
+        and _builtin_memory_requested
+        and (
+            _memory_toolset_requested
+            or not _external_memory_provider
+            or _external_memory_provider == "builtin"
+        )
+    )
+
+    if _use_builtin_store:
         try:
-            mem_config = _agent_cfg.get("memory", {})
             agent._memory_enabled = mem_config.get("memory_enabled", False)
             agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
-            if agent._memory_enabled or agent._user_profile_enabled:
-                from tools.memory_tool import MemoryStore
-                agent._memory_store = MemoryStore(
-                    memory_char_limit=mem_config.get("memory_char_limit", 2200),
-                    user_char_limit=mem_config.get("user_char_limit", 1375),
-                )
-                agent._memory_store.load_from_disk()
+            from tools.memory_tool import MemoryStore
+            agent._memory_store = MemoryStore(
+                memory_char_limit=mem_config.get("memory_char_limit", 2200),
+                user_char_limit=mem_config.get("user_char_limit", 1375),
+            )
+            agent._memory_store.load_from_disk()
         except Exception:
             pass  # Memory is optional -- don't break agent init
-    
+    else:
+        # Mirror the flags onto the agent so downstream checks behave consistently.
+        agent._memory_enabled = mem_config.get("memory_enabled", False)
+        agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
+        agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
 
 
     # Memory provider plugin (external — one at a time, alongside built-in)
